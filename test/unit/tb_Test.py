@@ -9,6 +9,7 @@ import py4hw
 
 import punxa_6502 as punxa
 
+from punxa_6502.interactive_commands import *
 
 
 def buildHw(model):
@@ -70,6 +71,9 @@ def buildHw(model):
     #    print(f'{data[i]:02X} ', end='')
     
     print()
+    import punxa_6502.interactive_commands as cmd
+    cmd._ci_mem = memory
+    cmd._ci_cpu = cpu
     
     
 buildHw('sc')
