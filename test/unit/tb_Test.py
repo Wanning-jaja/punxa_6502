@@ -11,7 +11,7 @@ import punxa_6502 as punxa
 
 
 
-def buildHw():
+def buildHw(model):
     global hw
     global cpu
     global mem
