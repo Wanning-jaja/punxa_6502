@@ -128,6 +128,7 @@ def buildHw(arch):
     
     
     if (arch == 'sc'):
+        print('Building Single Cycle Algorithmic Model')
         cpu = punxa.SingleCycle6502(hw, 'cpu', port_c, reset, irq, nmi, 0)
         
         cpu.nmi_address = (nmi_hi << 8) | nmi_lo
@@ -137,6 +138,7 @@ def buildHw(arch):
         cpu.pc = cpu.reset_address
         
     elif (arch == 'mc'):
+        print('Building Multi Cycle Structural Datapath + Algorithmic Control Unit Model')
         cpu = punxa.MultiCycle6502(hw, 'cpu', port_c, reset, irq, nmi, (reset_hi << 8) | reset_lo)
     
     
