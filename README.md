@@ -1,6 +1,12 @@
 # punxa_6502
 A 6502 system emulator in py4hw
 
+## Design
+
+6502 is implemented as a multicyle processor.
+The datapath is depicted by the following figure.
+
+![Multicycle Datapath](docs/multicycle_datapath.png)
 
 ## Installing Software Compilation Flow
 To compile C programs for the 6502 you need the SDCC compiler.
