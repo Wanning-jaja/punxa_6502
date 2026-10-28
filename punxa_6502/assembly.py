@@ -1,13 +1,14 @@
-"""In-process NMOS 6502 assembler for the ISA tests' initial ca65 subset.
+"""In-process NMOS 6502 assembler for the formal ISA tests' ca65 subset.
 
 The frontend expands once, then layout fixes every instruction's width before
 emission resolves forward references. No external assembler, linker or CPU is
 used. CODE defaults to $0200 and may never enter the data area at $1000.
 
-This is not a general ca65 replacement: there is one CODE segment, no data or
-padding directives, and no address-size overrides/relaxation. Known integer
-operands use zero page when legal; unresolved operands conservatively reserve
-an absolute form when one exists. Equates are immutable, symbols case-sensitive.
+This is not a general ca65 replacement: there is one CODE segment and no
+address-size overrides/relaxation. Known integer operands use zero page when
+legal; unresolved operands conservatively reserve an absolute form when one
+exists. Equates are immutable, symbols case-sensitive. Alignment is relative
+to the CODE segment, as in ca65, rather than to a guessed absolute address.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from typing import Sequence
 
 from . import instruction_decode as isa
 from .asm_expressions import ExpressionError, UndefinedSymbolError, evaluate
-from .asm_frontend import AssemblyError, SourceLine, preprocess
+from .asm_frontend import AssemblyError, SourceLine, _split_arguments, preprocess
 
 
 __all__ = ["AssemblyError", "AssemblyResult", "ListingEntry",
@@ -44,7 +45,11 @@ _MNEMONICS = {mnemonic for mnemonic, mode in _ENCODINGS}
 
 @dataclass(frozen=True)
 class ListingEntry:
-    """One emitted instruction, with byte address and original source location."""
+    """An instruction or data/padding directive and its source location.
+
+    Directive entries use their uppercase name as mnemonic and DATA/FILL as
+    mode. Raw .byte/.word instructions remain data; no disassembly is inferred.
+    """
 
     address: int
     data: bytes
@@ -68,6 +73,24 @@ class _Instruction:
     mnemonic: str
     mode: str
     expression: str | None
+    source: SourceLine
+
+
+@dataclass(frozen=True)
+class _Data:
+    address: int
+    directive: str
+    expressions: tuple[str, ...]
+    width: int
+    source: SourceLine
+
+
+@dataclass(frozen=True)
+class _Fill:
+    address: int
+    directive: str
+    count: int
+    value: int
     source: SourceLine
 
 
@@ -155,6 +178,26 @@ def _encode(instruction: _Instruction, symbols: dict[str, int]) -> bytes:
     return data + value.to_bytes(size, "little")
 
 
+def _listing_entry(record: _Instruction | _Data | _Fill,
+                   symbols: dict[str, int]) -> ListingEntry:
+    if isinstance(record, _Instruction):
+        return ListingEntry(record.address, _encode(record, symbols),
+                            record.mnemonic, record.mode, record.source)
+    if isinstance(record, _Fill):
+        data = bytes([record.value]) * record.count
+        mode = "FILL"
+    else:
+        values = bytearray()
+        for expression in record.expressions:
+            value = _value(expression, symbols, record.address + len(values), record.source)
+            maximum = (1 << (8 * record.width)) - 1
+            if not 0 <= value <= maximum:
+                raise AssemblyError(f"{record.directive} value {value} outside 0..{maximum}", record.source)
+            values.extend(value.to_bytes(record.width, "little"))
+        data, mode = bytes(values), "DATA"
+    return ListingEntry(record.address, data, record.directive.upper(), mode, record.source)
+
+
 def assemble_program(
     source: str,
     origin: int = 0x0200,
@@ -165,10 +208,13 @@ def assemble_program(
 ) -> AssemblyResult:
     """Assemble source into bytes/symbols without creating any output files.
 
-    Includes resolve relative to ``source_name``, then ``include_dirs``. The
-    supported directives are .setcpu "6502", .segment "CODE", .export and
-    .assert, plus the frontend's include guards and macros. Unknown directives
-    are errors. All assertions are checked after symbol resolution.
+    Includes resolve relative to ``source_name``, then ``include_dirs``.
+    Includes/macros/conditionals/repeats are expanded before layout. Data and
+    padding directives are .byte, .word, .res and .align (default fill zero).
+    Counts/alignment/fills must be known at their declaration; data values may
+    reference forward labels. Unknown directives are errors. ``error`` assertions
+    are checked as soon as resolvable within assembly; ``lderror`` assertions
+    are checked against the final linked layout after assembly assertions.
     """
     if not isinstance(origin, int) or not 0 <= origin < _DATA_START:
         raise AssemblyError("CODE origin must be an integer below reserved data at $1000")
@@ -179,9 +225,18 @@ def assemble_program(
     definitions: set[str] = set()
     exports: dict[str, SourceLine] = {}
     pending: list[tuple[str, str, int, SourceLine]] = []
-    assertions: list[tuple[str, str, int, SourceLine]] = []
-    instructions: list[_Instruction] = []
+    assertions: list[tuple[str, str, str, int, SourceLine]] = []
+    records: list[_Instruction | _Data | _Fill] = []
     pc = origin
+
+    def reserve(record: _Instruction | _Data | _Fill, count: int):
+        nonlocal pc
+        pc += count
+        if pc - origin > max_size:
+            raise AssemblyError(f"CODE exceeds max_size ${max_size:04X}", record.source)
+        if pc > _DATA_START:
+            raise AssemblyError("CODE overlaps reserved data beginning at $1000", record.source)
+        records.append(record)
 
     # Pass 1: assign byte addresses and freeze every instruction's mode/width.
     for line in lines:
@@ -221,17 +276,47 @@ def assemble_program(
                 match = re.fullmatch(r'(.+),\s*(error|lderror)\s*,\s*"([^"\n]*)"', argument)
                 if not match:
                     raise AssemblyError('.assert requires expression, error/lderror, "message"', line)
-                assertions.append((match[1].strip(), match[3], pc, line))
+                expression, phase, message = match[1].strip(), match[2], match[3]
+                if phase == "error":
+                    try:
+                        condition = evaluate(expression, symbols, pc=pc)
+                    except UndefinedSymbolError:
+                        pass  # Forward references are resolved within this CODE unit.
+                    except ExpressionError as error:
+                        raise AssemblyError(str(error), line) from error
+                    else:
+                        if not condition:
+                            raise AssemblyError(f"assembly assertion failed: {message}", line)
+                        continue
+                assertions.append((expression, phase, message, pc, line))
+            elif name in (".byte", ".word"):
+                expressions = tuple(_split_arguments(argument, line))
+                if not expressions:
+                    raise AssemblyError(f"{name} requires at least one expression", line)
+                width = 1 if name == ".byte" else 2
+                reserve(_Data(pc, name, expressions, width, line), width * len(expressions))
+            elif name in (".res", ".align"):
+                arguments = _split_arguments(argument, line)
+                if not 1 <= len(arguments) <= 2:
+                    raise AssemblyError(f"{name} requires count/alignment and optional fill byte", line)
+                amount = _value(arguments[0], symbols, pc, line)
+                fill = _value(arguments[1], symbols, pc, line) if len(arguments) == 2 else 0
+                if not 0 <= fill <= 255:
+                    raise AssemblyError(f"{name} fill byte outside 0..255: {fill}", line)
+                if name == ".align":
+                    if not 1 <= amount <= 65536:
+                        raise AssemblyError(".align requires an alignment in 1..65536", line)
+                    count = (-(pc - origin)) % amount
+                else:
+                    if amount < 0:
+                        raise AssemblyError(".res count must be nonnegative", line)
+                    count = amount
+                reserve(_Fill(pc, name, count, fill, line), count)
             else:
                 raise AssemblyError(f"unsupported directive: {name}", line)
             continue
         instruction = _instruction(text, symbols, pc, line)
-        instructions.append(instruction)
-        pc += 1 + isa.OPERAND_SIZE_MAP[instruction.mode]
-        if pc - origin > max_size:
-            raise AssemblyError(f"CODE exceeds max_size ${max_size:04X}", line)
-        if pc > _DATA_START:
-            raise AssemblyError("CODE overlaps reserved data beginning at $1000", line)
+        reserve(instruction, 1 + isa.OPERAND_SIZE_MAP[instruction.mode])
 
     # Immutable forward equates are resolved without revisiting frozen layout.
     while pending:
@@ -248,16 +333,20 @@ def assemble_program(
             raise AssemblyError(f"undefined or cyclic equate {name}: {expression}", line)
         pending = unresolved
 
-    # Pass 2: emit using the resolved symbols, never resize an instruction.
-    listing = tuple(ListingEntry(item.address, _encode(item, symbols),
-                                 item.mnemonic, item.mode, item.source)
-                    for item in instructions)
-    for expression, message, location, line in assertions:
-        if not _value(expression, symbols, location, line):
-            raise AssemblyError(f"assertion failed: {message}", line)
+    def check_assertions(phase: str):
+        for expression, requested_phase, message, location, line in assertions:
+            if requested_phase == phase and not _value(expression, symbols, location, line):
+                stage = "assembly" if phase == "error" else "link"
+                raise AssemblyError(f"{stage} assertion failed: {message}", line)
+
+    # Finish assembly (including all operand resolution) before link assertions.
+    check_assertions("error")
     for name, line in exports.items():
         if name not in symbols:
             raise AssemblyError(f"exported symbol is undefined: {name}", line)
+    # Pass 2: emit using resolved symbols, never resize an instruction or block.
+    listing = tuple(_listing_entry(item, symbols) for item in records)
+    check_assertions("lderror")
     return AssemblyResult(origin, b"".join(item.data for item in listing),
                           symbols, frozenset(exports), listing)
 

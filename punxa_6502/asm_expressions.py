@@ -4,7 +4,7 @@ This is deliberately not Python expression evaluation.  Names are case-sensitive
 ``$`` introduces hexadecimal integers, and ``*`` denotes the current byte PC.
 Unary ``<`` and ``>`` extract the low and high byte; in infix position they are
 comparisons.  Operators, from tightest to loosest, are unary ``+ - < >``, binary
-``+ -``, ``&``, ``^``, comparisons, and boolean ``.and``.  Parentheses override
+``& ^`` (one shared level), ``+ -``, comparisons, and boolean ``.and``.  Parentheses override
 precedence.  Unsupported ca65 syntax is rejected rather than approximated.
 """
 
@@ -51,10 +51,10 @@ _PRECEDENCE = {
     ">": 20,
     "<=": 20,
     ">=": 20,
-    "^": 30,
-    "&": 40,
-    "+": 50,
-    "-": 50,
+    "^": 50,
+    "&": 50,
+    "+": 40,
+    "-": 40,
 }
 
 

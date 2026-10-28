@@ -1,7 +1,7 @@
 """Small, source-aware preprocessor for the ISA assembler's ca65 subset.
 
-Only the include and macro facilities needed by the unchanged ADC example are
-implemented here. Other assembly directives remain in the output so that the
+Includes, macros, constant conditionals and repetition cover the ISA sources'
+preprocessing subset. Layout/data directives remain in the output so that the
 assembler can validate them rather than silently discarding their effects.
 """
 
@@ -11,6 +11,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 import re
 from typing import Sequence
+
+from .asm_expressions import ExpressionError, evaluate
 
 
 _IDENTIFIER = r"[A-Za-z_][A-Za-z_0-9]*"
@@ -53,6 +55,15 @@ class _Macro:
     parameters: tuple[str, ...]
     body: tuple[SourceLine, ...]
     source: SourceLine
+
+
+@dataclass
+class _Conditional:
+    parent_active: bool
+    condition: bool
+    source: SourceLine
+    directive: str
+    seen_else: bool = False
 
 
 def _without_comment(text: str, source: SourceLine) -> str:
@@ -127,6 +138,9 @@ class _Preprocessor:
         self.local_serial = 0
         self.output: list[SourceLine] = []
         self.include_stack: list[Path] = []
+        self.constants: dict[str, int] = {}
+        self.constant_definitions: set[str] = set()
+        self.process_depth = 0
 
     @staticmethod
     def lines(source: str, filename: str, expansion: tuple[str, ...] = ()):
@@ -200,10 +214,59 @@ class _Preprocessor:
             body.append(replace(source, text=_substitute(source.text, replacements), expansion=expansion))
         self.process(body, depth + 1)
 
+    def constant_value(self, expression: str, source: SourceLine, directive: str) -> int:
+        try:
+            return evaluate(expression, self.constants)
+        except ExpressionError as error:
+            raise AssemblyError(
+                f"{directive} requires an already-defined constant expression: {error}",
+                source,
+            ) from error
+
+    @staticmethod
+    def repeat_lines(body: list[SourceLine], iterator: str | None,
+                     iteration: int, frame: str) -> list[SourceLine]:
+        """Substitute one lexical iterator, respecting nested iterator shadowing."""
+        replacements = {iterator: str(iteration)} if iterator else {}
+        result = []
+        shadowed = False
+        scopes = []
+        for member in body:
+            directive = _DIRECTIVE.match(member.text)
+            name = directive.group(1).lower() if directive else None
+            text = member.text
+            if name == ".repeat":
+                arguments = _split_arguments(directive.group(2), member)
+                scopes.append(shadowed)
+                if iterator and len(arguments) == 2 and arguments[1] == iterator:
+                    # The nested count still belongs to the surrounding scope;
+                    # its declared iterator and body belong to the inner one.
+                    count = arguments[0] if shadowed else _substitute(arguments[0], replacements)
+                    text = f".repeat {count}, {iterator}"
+                    shadowed = True
+                elif not shadowed:
+                    text = _substitute(text, replacements)
+            elif name == ".endrepeat":
+                if scopes:
+                    shadowed = scopes.pop()
+            elif not shadowed:
+                text = _substitute(text, replacements)
+            result.append(replace(member, text=text, expansion=member.expansion + (frame,)))
+        return result
+
     def process(self, lines: list[SourceLine], macro_depth: int = 0):
-        # Each include/macro owns its guard nesting. Unbalanced guards cannot
-        # accidentally close a conditional in the including/calling source.
-        guards: list[tuple[bool, SourceLine]] = []
+        if self.process_depth >= 128:
+            raise AssemblyError("preprocessing nesting exceeds 128", lines[0] if lines else None)
+        self.process_depth += 1
+        try:
+            self._process(lines, macro_depth)
+        finally:
+            self.process_depth -= 1
+
+    def _process(self, lines: list[SourceLine], macro_depth: int):
+        # Each include/macro/repeat owns balanced conditional nesting. A block
+        # cannot accidentally close a conditional in its caller's source.
+        guards: list[_Conditional] = []
         active = True
         index = 0
         while index < len(lines):
@@ -215,21 +278,74 @@ class _Preprocessor:
             directive = _DIRECTIVE.match(text)
             name = directive.group(1).lower() if directive else None
             argument = directive.group(2).strip() if directive else ""
-            if name == ".ifndef":
-                if not re.fullmatch(_IDENTIFIER, argument):
-                    raise AssemblyError(".ifndef requires one identifier", source)
-                guards.append((active, source))
-                active = active and argument not in self.defined
+            if name in (".if", ".ifndef"):
+                if name == ".ifndef":
+                    if not re.fullmatch(_IDENTIFIER, argument):
+                        raise AssemblyError(".ifndef requires one identifier", source)
+                    condition = argument not in self.defined if active else False
+                else:
+                    condition = bool(self.constant_value(argument, source, name)) if active else False
+                guards.append(_Conditional(active, condition, source, name))
+                active = active and condition
+                continue
+            if name == ".else":
+                if argument:
+                    raise AssemblyError("unexpected text after .else", source)
+                if not guards:
+                    raise AssemblyError(".else without .if/.ifndef", source)
+                frame = guards[-1]
+                if frame.seen_else:
+                    raise AssemblyError("duplicate .else", source)
+                frame.seen_else = True
+                active = frame.parent_active and not frame.condition
                 continue
             if name == ".endif":
                 if argument:
                     raise AssemblyError("unexpected text after .endif", source)
                 if not guards:
-                    raise AssemblyError(".endif without .ifndef", source)
-                active, _ = guards.pop()
+                    raise AssemblyError(".endif without .if/.ifndef", source)
+                active = guards.pop().parent_active
                 continue
-            if name in (".if", ".ifdef", ".else", ".elseif"):
+            if name in (".ifdef", ".elseif"):
                 raise AssemblyError(f"unsupported conditional directive: {name}", source)
+            if name == ".repeat":
+                # Collect before evaluating the count so an inactive block (or
+                # count zero) never evaluates conditions in the repeated body.
+                body = []
+                nesting = 1
+                while index < len(lines):
+                    member = lines[index]
+                    index += 1
+                    member_directive = _DIRECTIVE.match(member.text)
+                    member_name = member_directive.group(1).lower() if member_directive else None
+                    if member_name == ".repeat":
+                        nesting += 1
+                    elif member_name == ".endrepeat":
+                        nesting -= 1
+                        if not nesting:
+                            if member_directive.group(2).strip():
+                                raise AssemblyError("unexpected text after .endrepeat", member)
+                            break
+                    body.append(member)
+                else:
+                    raise AssemblyError("unterminated .repeat", source)
+                if active:
+                    arguments = _split_arguments(argument, source)
+                    if not 1 <= len(arguments) <= 2:
+                        raise AssemblyError(".repeat requires count and optional iterator", source)
+                    iterator = arguments[1] if len(arguments) == 2 else None
+                    if iterator is not None and not re.fullmatch(_IDENTIFIER, iterator):
+                        raise AssemblyError(".repeat iterator must be an identifier", source)
+                    count = self.constant_value(arguments[0], source, name)
+                    if not 0 <= count <= 65536:
+                        raise AssemblyError(".repeat count must be in 0..65536", source)
+                    for iteration in range(count):
+                        frame = f"repeat {iteration} at {source.filename}:{source.line}"
+                        expanded = self.repeat_lines(body, iterator, iteration, frame)
+                        self.process(expanded, macro_depth)
+                continue
+            if name == ".endrepeat":
+                raise AssemblyError(".endrepeat without .repeat", source)
             if name == ".macro":
                 match = re.fullmatch(rf"({_IDENTIFIER})(?:\s+(.*))?", argument)
                 if not match:
@@ -284,10 +400,21 @@ class _Preprocessor:
                 continue
             assignment = _ASSIGNMENT.match(text)
             if assignment:
-                self.defined.add(assignment.group(1))
+                constant = assignment.group(1)
+                if constant in self.constant_definitions:
+                    raise AssemblyError(f"duplicate symbol: {constant}", source)
+                self.defined.add(constant)
+                self.constant_definitions.add(constant)
+                try:
+                    self.constants[constant] = evaluate(text[assignment.end():], self.constants)
+                except ExpressionError:
+                    # Label/PC-dependent equates belong to layout. They remain
+                    # unavailable to .if/.repeat instead of being guessed as 0.
+                    pass
             self.output.append(source)
         if guards:
-            raise AssemblyError("unterminated .ifndef", guards[-1][1])
+            frame = guards[-1]
+            raise AssemblyError(f"unterminated {frame.directive}", frame.source)
 
 
 def preprocess(

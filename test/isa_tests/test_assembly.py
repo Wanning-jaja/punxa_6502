@@ -6,6 +6,7 @@ the project's decoder. They do not count as ISA CPU execution coverage.
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from punxa_6502.assembly import (
     AssemblyError, AssemblyResult, assemble_file, assemble_program,
@@ -287,13 +288,234 @@ status=$2004
                 with self.assertRaises(AssemblyError):
                     assemble_program(source)
 
-    def test_unsupported_phase_two_directives_are_explicit_errors(self):
-        for source in (".if 1\nclc\n.endif", ".repeat 2\nclc\n.endrepeat",
-                       ".align $100", ".res 1", ".byte $6C", ".word $1234",
+    def test_unsupported_directives_are_explicit_errors(self):
+        for source in (".org $0200", '.incbin "unknown.bin"',
+                       ".ifdef X\nclc\n.endif", ".elseif 1", ".proc name",
                        '.setcpu "65C02"', '.segment "BSS"'):
             with self.subTest(source=source):
                 with self.assertRaises(AssemblyError):
                     assemble_program(source)
+
+
+class DataAndExpansionTests(unittest.TestCase):
+    def test_public_file_api_never_calls_external_assembler_or_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            (folder / "protocol.inc").write_text("""
+.ifndef INCLUDED
+INCLUDED=1
+status=$2004
+.export status
+.macro EMIT value
+    .if value = 1
+        .byte $A5
+    .else
+        .word status
+    .endif
+.endmacro
+.endif
+""", encoding="utf-8")
+            program = folder / "main.asm"
+            program.write_text("""
+.include "protocol.inc"
+.export start,end
+start:
+.repeat 2,index
+    EMIT index
+.endrepeat
+end: clc
+""", encoding="utf-8")
+            forbidden = AssertionError("external assembler discovery/execution is forbidden")
+            with (
+                mock.patch("subprocess.run", side_effect=forbidden) as run,
+                mock.patch("subprocess.Popen", side_effect=forbidden) as popen,
+                mock.patch("shutil.which", side_effect=forbidden) as which,
+            ):
+                result = assemble_file(program)
+            run.assert_not_called()
+            popen.assert_not_called()
+            which.assert_not_called()
+            self.assertEqual(result.code, bytes.fromhex("04 20 A5 18"))
+            self.assertEqual({name: result.symbols[name] for name in result.exports},
+                             {"status": 0x2004, "start": 0x0200, "end": 0x0203})
+
+    def test_nested_conditionals_use_macro_arguments_and_skip_inactive_code(self):
+        source = """
+.macro PICK outer, inner
+    .if outer
+        .if inner
+            lda #1
+        .else
+            lda #2
+        .endif
+    .else
+        lda #3
+    .endif
+.endmacro
+PICK 1, 0
+PICK 1, 1
+PICK 0, never_defined
+"""
+        self.assertEqual(assemble_program(source).code,
+                         bytes.fromhex("A9 02 A9 01 A9 03"))
+
+    def test_if_expression_constants_and_unselected_unknown_expression(self):
+        source = """
+LIMIT=2
+.if LIMIT >= 1 .and LIMIT <= 3
+    .byte $AA
+.else
+    not_a_real_instruction
+.endif
+.if 0
+    .if never_defined
+        .byte invalid_value
+    .endif
+.else
+    .byte $55
+.endif
+"""
+        self.assertEqual(assemble_program(source).code, bytes.fromhex("AA 55"))
+
+    def test_malformed_and_unresolved_conditionals_are_errors(self):
+        for source in (".if 1\nclc", ".else", ".if unknown\nclc\n.endif",
+                       ".if 1\n.else\n.else\n.endif", ".if\n.endif",
+                       ".if later\nclc\n.endif\nlater=1"):
+            with self.subTest(source=source):
+                with self.assertRaises(AssemblyError):
+                    assemble_program(source)
+
+    def test_repeat_zero_default_and_named_iterators(self):
+        source = """
+.repeat 0
+    .byte unknown
+.endrepeat
+.repeat 2
+    .byte $A5
+.endrepeat
+.repeat 3, index
+    .byte index
+.endrepeat
+"""
+        self.assertEqual(assemble_program(source).code,
+                         bytes.fromhex("A5 A5 00 01 02"))
+
+    def test_nested_repeats_and_macro_local_labels_remain_distinct(self):
+        source = """
+.macro LOAD value
+    .local done
+    lda #value
+    bne done
+    clc
+done:
+.endmacro
+.repeat 2, index
+    LOAD index+1
+.endrepeat
+.repeat 2, outer
+    .repeat 2, inner
+        .byte outer+inner
+    .endrepeat
+.endrepeat
+"""
+        self.assertEqual(assemble_program(source).code, bytes.fromhex(
+            "A9 01 D0 01 18 A9 02 D0 01 18 00 01 01 02"))
+
+    def test_repeat_iterator_does_not_escape_its_block(self):
+        with self.assertRaises(AssemblyError):
+            assemble_program(".repeat 2, index\n.byte index\n.endrepeat\n.byte index")
+
+    def test_invalid_repeat_counts_and_blocks_are_errors(self):
+        for source in (".repeat -1\nclc\n.endrepeat", ".repeat 2\nclc",
+                       ".endrepeat", ".repeat unknown\nclc\n.endrepeat",
+                       ".repeat 2, 3\nclc\n.endrepeat"):
+            with self.subTest(source=source):
+                with self.assertRaises(AssemblyError):
+                    assemble_program(source)
+
+    def test_byte_and_word_values_use_fixed_little_endian_vectors(self):
+        result = assemble_program(".byte $00,$7F,$80,$FF\n.word $0000,$1234,$FFFF")
+        self.assertEqual(result.code, bytes.fromhex("00 7F 80 FF 00 00 34 12 FF FF"))
+
+    def test_raw_jmp_encoding_and_forward_label_low_high_bytes(self):
+        source = ".byte $6C\n.word $12FF\n.byte <landing,>landing\n.word landing\nlanding: clc"
+        result = assemble_program(source)
+        self.assertEqual(result.symbols["landing"], 0x0207)
+        self.assertEqual(result.code, bytes.fromhex("6C FF 12 07 02 07 02 18"))
+
+    def test_current_pc_and_equates_follow_byte_data_layout(self):
+        result = assemble_program("start=*\n.byte <*\n.word *\nend:\n"
+                                  '.assert end-start = 3, lderror, "byte layout"')
+        self.assertEqual(result.code, bytes.fromhex("00 01 02"))
+        self.assertEqual(result.symbols["end"], 0x0203)
+
+    def test_current_pc_advances_for_each_data_element(self):
+        result = assemble_program(".byte <*,<*\n.word *,*")
+        self.assertEqual(result.code, bytes.fromhex("00 01 02 02 04 02"))
+
+    def test_branch_displacements_include_raw_data_widths(self):
+        result = assemble_program("start: bne finish\n.byte $AA,$BB\n.word start\n"
+                                  "finish: bne start")
+        self.assertEqual(result.code, bytes.fromhex("D0 04 AA BB 00 02 D0 F8"))
+
+    def test_align_and_res_explicit_and_default_fill(self):
+        source = (".byte $AA\n.align 4,$CC\n.byte $BB\n.align 4\n"
+                  ".res 2,$DD\n.res 1\nend:")
+        result = assemble_program(source)
+        self.assertEqual(result.code,
+                         bytes.fromhex("AA CC CC CC BB 00 00 00 DD DD 00"))
+        self.assertEqual(result.symbols["end"], 0x020B)
+        self.assertEqual(assemble_program(".res 0\n.align 1\nclc").code,
+                         bytes.fromhex("18"))
+
+    def test_alignment_is_segment_relative_even_at_unaligned_origin(self):
+        result = assemble_program(".byte $AA\n.align 4,$CC\nlanding: .byte $BB",
+                                  origin=0x0201)
+        self.assertEqual(result.code, bytes.fromhex("AA CC CC CC BB"))
+        self.assertEqual(result.symbols["landing"], 0x0205)
+        self.assertEqual(assemble_program(".byte $AA\n.align 3,$CC\n.byte $BB").code,
+                         bytes.fromhex("AA CC CC BB"))
+        self.assertEqual(assemble_program(".align 65536\nclc").code, b"\x18")
+
+    def test_padding_preserves_signed_branch_limits(self):
+        forward = assemble_program("bne end\n.res 127\nend: clc")
+        self.assertEqual(forward.code[:2], bytes.fromhex("D0 7F"))
+        with self.assertRaises(AssemblyError):
+            assemble_program("bne end\n.res 128\nend: clc")
+        backward = assemble_program("start: .res 126\nbne start")
+        self.assertEqual(backward.code[-2:], bytes.fromhex("D0 80"))
+
+    def test_data_and_padding_cannot_enter_reserved_memory(self):
+        for source in (".byte 1,2", ".word 1", ".res 2", ".align 4\n.res 2"):
+            with self.subTest(source=source):
+                with self.assertRaises(AssemblyError):
+                    assemble_program(source, origin=0x0FFF, max_size=0x100)
+
+    def test_invalid_data_padding_values_and_forward_sizes_are_errors(self):
+        for source in (".byte 256", ".word $10000", ".byte unknown",
+                       ".byte -1", ".word -1",
+                       ".res -1", ".res 1,256", ".align 0", ".align -1",
+                       ".align 65537", ".align 4,256", ".res later\nlater=2",
+                       ".align later\nlater=4", ".byte", ".word", ".res"):
+            with self.subTest(source=source):
+                with self.assertRaises(AssemblyError):
+                    assemble_program(source)
+
+    def test_layout_assertions_check_final_symbols_for_both_severities(self):
+        for severity in ("error", "lderror"):
+            source = ('.assert end-start = 4, ' + severity + ', "wrong width"\n'
+                      "start: .byte 1\n.res 3\nend:")
+            with self.subTest(severity=severity):
+                self.assertEqual(assemble_program(source).code,
+                                 bytes.fromhex("01 00 00 00"))
+                with self.assertRaisesRegex(AssemblyError, "wrong width"):
+                    assemble_program(source.replace("= 4", "= 5"))
+
+    def test_error_assertion_precedes_emission_but_lderror_is_deferred(self):
+        with self.assertRaisesRegex(AssemblyError, "assembly guard"):
+            assemble_program('.assert 0, error, "assembly guard"\nlda missing')
+        with self.assertRaisesRegex(AssemblyError, "undefined symbol: missing"):
+            assemble_program('.assert 0, lderror, "link guard"\nlda missing')
 
 
 class ExpressionTests(unittest.TestCase):
@@ -308,6 +530,8 @@ class ExpressionTests(unittest.TestCase):
             ("number = 255", 1), ("number <> 255", 0),
             ("number < 256", 1), ("number > 255", 0),
             ("number <= 254", 0), ("number >= 256", 0),
+            # ca65 gives bitwise &,^ equal precedence, tighter than addition.
+            ("1+2 & 2 ^ 1", 4), ("1 ^ 3 & 2", 2),
         )
         for expression, expected in vectors:
             with self.subTest(expression=expression):
