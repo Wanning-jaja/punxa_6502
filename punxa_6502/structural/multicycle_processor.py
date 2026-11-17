@@ -2485,6 +2485,14 @@ class ControlUnit6502Behavioral(py4hw.Logic):
         n = self.status['q_N'].get()
         print(f'\t\tPLA\t\t--> A={a:02X} N={n} Z={z}')
 
+    def executePLP(self):
+        yield from self.popMBR()           # SP = SP + 1, MBR = mem[$0100+SP]
+        yield from self.restoreFlags()     # C Z I D V N <- MBR bits (B and bit 5 ignored)
+        yield from self.incPC()
+        p = self.parent.children['datapath']._wires['q_P'].get()
+        sp = self.parent.children['datapath']._wires['q_SP'].get()
+        print(f'\t\tPLP\t\t--> P={p:02X} SP={sp:02X}')
+
     def executeROL_ABS(self):
         yield from self.incPC()
         yield from self.fetchMAR_lo()          # address low byte -> MAR_lo
@@ -4077,6 +4085,8 @@ class ControlUnit6502Behavioral(py4hw.Logic):
             yield from self.executePHP()
         elif (op == self.OPCODE_PLA):
             yield from self.executePLA()
+        elif (op == self.OPCODE_PLP):
+            yield from self.executePLP()
         elif (op == self.OPCODE_ROL_ABS):
             yield from self.executeROL_ABS()
         elif (op == self.OPCODE_ROL_ABSX):

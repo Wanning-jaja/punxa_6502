@@ -622,6 +622,17 @@ class SingleCycle6502(py4hw.Logic):
             self.Z = (self.A == 0) & 1
             print(f'PLA \t\t--> [{spa:04X}]={self.A:02X} A={self.A:02X} N={self.N} Z={self.Z} SP={self.SP:02X} ')
             
+        elif (op == 'PLP'):
+            P, spa = yield from self.pop8()
+            # P = N V 1 B D I Z C; bit 5 and B are not stored flags, so they are ignored
+            self.N = (P >> 7) & 1
+            self.V = (P >> 6) & 1
+            self.D = (P >> 3) & 1
+            self.I = (P >> 2) & 1
+            self.Z = (P >> 1) & 1
+            self.C = P & 1
+            print(f'PLP \t\t--> [{spa:04X}]={P:02X} N={self.N} V={self.V} D={self.D} I={self.I} Z={self.Z} C={self.C} SP={self.SP:02X}')
+
         elif (op == 'RTS'):
             self.SP = (self.SP + 1) & 0xFF
             spl = 0x0100 | self.SP
